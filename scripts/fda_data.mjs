@@ -57,30 +57,58 @@ function stripXml(xml) {
     .trim();
 }
 
+// The eCFR full endpoint with a section parameter returns just that section server-side;
+// 404 means the section does not exist in that date's edition.
+async function fetchSectionXml(part, section, date) {
+  const url = `https://www.ecfr.gov/api/versioner/v1/full/${date}/title-21.xml?part=${part}&section=${section}`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`eCFR section fetch failed: HTTP ${response.status} (§ ${section}, date ${date})`);
+  return response.text();
+}
+
 async function cmdRegulation(arg) {
   const citation = parseCitation(arg);
   const titles = await getJson('https://www.ecfr.gov/api/versioner/v1/titles.json');
   const title21 = (titles.titles ?? []).find((t) => t.number === 21);
   if (!title21) die('Title 21 not found in eCFR titles.json.');
   const date = title21.latest_issue_date;
-  const url = `https://www.ecfr.gov/api/versioner/v1/full/${date}/title-21.xml?part=${citation.part}`;
-  const response = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-  if (!response.ok) die(`eCFR full-text fetch failed: HTTP ${response.status} (part ${citation.part}, date ${date})`);
-  const xml = await response.text();
-  const sectionPattern = new RegExp(
-    `<DIV8[^>]*N="[^"]*${citation.section.replace('.', '\\.')}"[^>]*>([\\s\\S]*?)</DIV8>`,
-    'u',
-  );
-  const match = sectionPattern.exec(xml);
-  if (!match) {
-    console.log(`Section § ${citation.section} not located in the current 21 CFR Part ${citation.part} text (version ${date}).`);
-    console.log('Possible reasons: the section number does not exist or is reserved. Browse the full part at the source below.');
+  const currentXml = await fetchSectionXml(citation.part, citation.section, date);
+  if (currentXml !== null) {
+    console.log(`21 CFR § ${citation.section} (eCFR version ${date}, current)`);
+    console.log(stripXml(currentXml));
+    printSource(`https://www.ecfr.gov/current/title-21/section-${citation.section}`);
+    return;
+  }
+  // Not in the current edition: consult the revision history to distinguish "removed"
+  // from "never existed"; for removed sections fall back to the last pre-removal text,
+  // clearly labeled as historical.
+  const versionsUrl = `https://www.ecfr.gov/api/versioner/v1/versions/title-21.json?part=${citation.part}&section=${citation.section}`;
+  const versions = ((await getJson(versionsUrl)).content_versions ?? [])
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const last = versions.at(-1);
+  if (!last?.removed) {
+    console.log(`Section § ${citation.section} was not located in 21 CFR Part ${citation.part} (version ${date}), and the eCFR revision history has no record of it.`);
+    console.log('Check the citation; browse the current part structure at the source below.');
     printSource(`https://www.ecfr.gov/current/title-21/part-${citation.part}`);
     return;
   }
-  console.log(`21 CFR § ${citation.section} (eCFR version ${date}, current)`);
-  console.log(stripXml(match[1]));
-  printSource(`https://www.ecfr.gov/current/title-21/section-${citation.section}`);
+  const removedDate = last.amendment_date ?? last.date;
+  const lastDay = new Date(`${removedDate}T00:00:00Z`);
+  lastDay.setUTCDate(lastDay.getUTCDate() - 1);
+  const histDate = lastDay.toISOString().slice(0, 10);
+  const sectionTitle = String(last.name ?? '').replace(/^§+\s*[\d.]+\s*/u, '');
+  console.log(`21 CFR § ${citation.section}${sectionTitle ? ` — ${sectionTitle}` : ''}`);
+  console.log(`Status: removed from the current CFR (eCFR revision date ${removedDate}); the number no longer exists or is [Reserved] in the current Part ${citation.part}.`);
+  const histXml = await fetchSectionXml(citation.part, citation.section, histDate);
+  if (histXml === null) {
+    console.log(`The last pre-removal text could not be retrieved; view it by date (${histDate}) at the source below.`);
+    printSource(`https://www.ecfr.gov/on/${histDate}/title-21/section-${citation.section}`);
+    return;
+  }
+  console.log(`The text below is the last pre-removal version (as of ${histDate}; HISTORICAL text, not a current requirement):`);
+  console.log(stripXml(histXml));
+  printSource(`https://www.ecfr.gov/on/${histDate}/title-21/section-${citation.section}`);
 }
 
 // ---------- recalls ----------
@@ -196,64 +224,83 @@ function dashboardHint(command) {
   console.log('3. Re-run this command. Inspection classifications and 483 citation data will then be live.');
 }
 
-async function dashboardQuery(resource, filters) {
+// Contract as measured (2026-08, verified against both resources): start is a 1-based row
+// offset and pages join exactly under a sort; resultcount equals the rows RETURNED, not the
+// total hits — exhaustion is detected only by a short page or statuscode 412.
+const DASHBOARD_PAGE_ROWS = 1000;
+const DASHBOARD_MAX_ROWS = 5000;
+
+async function dashboardQuery(resource, filters, sort = '') {
   const credentials = dashboardCredentials();
   const url = `${credentials.base}/${resource}`;
-  const payload = await getJson(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization-user': credentials.user,
-      'authorization-key': credentials.key,
-    },
-    // Official contract (datadashboard.fda.gov API docs): sort/sortorder/filters/columns are
-    // required keys (empty values take defaults); rows max is 5000. Response statuscode
-    // 400 = Success, 412 = no results. Fetching only the first page has previously hidden
-    // every OAI record for large firms — always fetch the full set, newest first.
-    body: JSON.stringify({
-      start: 1,
-      rows: 5000,
-      sort: 'InspectionEndDate',
-      sortorder: 'desc',
-      filters,
-      columns: [],
-      returntotalcount: true,
-    }),
-  });
-  if (payload.statuscode !== undefined && payload.statuscode !== 400 && payload.statuscode !== 412) {
-    throw new Error(`Dashboard statuscode ${payload.statuscode}: ${payload.message ?? ''}`);
+  const rows = [];
+  let truncated = false;
+  for (let start = 1; ; start += DASHBOARD_PAGE_ROWS) {
+    const payload = await getJson(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization-user': credentials.user,
+        'authorization-key': credentials.key,
+      },
+      // Official contract (datadashboard.fda.gov API docs): sort/sortorder/filters/columns
+      // are required keys (empty values take defaults). Response statuscode 400 = Success,
+      // 412 = no results. First-page-only fetching previously hid every OAI record for
+      // large firms — always page through the full set, newest first.
+      body: JSON.stringify({
+        start,
+        rows: DASHBOARD_PAGE_ROWS,
+        sort,
+        sortorder: sort === '' ? '' : 'DESC',
+        filters,
+        columns: [],
+      }),
+    });
+    if (payload.statuscode !== undefined && payload.statuscode !== 400 && payload.statuscode !== 412) {
+      throw new Error(`Dashboard statuscode ${payload.statuscode}: ${payload.message ?? ''}`);
+    }
+    const page = payload.result ?? payload.results ?? [];
+    rows.push(...page);
+    if (page.length < DASHBOARD_PAGE_ROWS) break;
+    if (rows.length >= DASHBOARD_MAX_ROWS) { truncated = true; break; }
   }
-  return { payload, url };
+  return { rows, truncated, url };
+}
+
+function printTruncation(truncated, count) {
+  if (truncated) console.log(`Note: hit the ${count}-row fetch cap (sorted by inspection end date, newest first); older records are not included.`);
 }
 
 async function cmdInspections(firm) {
   if (!dashboardCredentials()) { dashboardHint('inspections'); process.exit(3); }
-  const { payload, url } = await dashboardQuery('inspections_classifications', { LegalName: [firm] });
-  const rows = payload.result ?? payload.results ?? [];
-  const total = payload.totalrecordcount ?? rows.length;
-  console.log(`Inspection records — LegalName:"${firm}", ${total} total (showing latest ${Math.min(15, rows.length)}):`);
-  for (const r of rows.slice(0, 15)) {
+  const { rows, truncated, url } = await dashboardQuery('inspections_classifications', { LegalName: [firm] }, 'InspectionEndDate');
+  const inspectionCount = new Set(rows.map((r) => r.InspectionID).filter((id) => id !== undefined)).size;
+  console.log(`Inspection records — LegalName:"${firm}", ${rows.length} classification rows${inspectionCount > 0 ? ` (${inspectionCount} inspections; one inspection may span several project areas)` : ''}:`);
+  printTruncation(truncated, rows.length);
+  for (const r of rows) {
     console.log(`- ${r.InspectionEndDate ?? r.EndDate ?? '?'} | ${r.Classification ?? '?'} | ${r.ProjectArea ?? r.ProductType ?? ''} | FEI ${r.FEINumber ?? '?'} | ${r.City ?? ''} ${r.CountryName ?? ''}`);
   }
-  const tally = new Map();
-  for (const r of rows) {
-    const grade = /\(([A-Z]{3})\)/u.exec(r.Classification ?? '')?.[1] ?? r.Classification ?? '?';
-    tally.set(grade, (tally.get(grade) ?? 0) + 1);
-  }
-  if (rows.length > 0) {
-    console.log(`Classification tally (all ${rows.length} rows): ${[...tally.entries()].map(([g, c]) => `${g} ${c}`).join(' · ')}`);
-  }
-  if (rows.length === 5000) console.log('Note: hit the 5000-row single-request cap; tallies may be incomplete.');
   if (rows.length === 0) console.log('No records found. Try dropping company suffixes or searching by FEI number — legal names often differ from trade names.');
+  const byClass = new Map();
+  for (const r of rows) {
+    const cls = r.Classification ?? '?';
+    byClass.set(cls, (byClass.get(cls) ?? 0) + 1);
+  }
+  if (byClass.size > 0) {
+    console.log('');
+    console.log('Classification frequency (by classification row):');
+    for (const [cls, count] of [...byClass.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`- ${cls}: ${count}`);
+    }
+  }
   printSource(url);
 }
 
 async function cmdCitations(firm) {
   if (!dashboardCredentials()) { dashboardHint('citations'); process.exit(3); }
-  const { payload, url } = await dashboardQuery('inspections_citations', { LegalName: [firm] });
-  const rows = payload.result ?? payload.results ?? [];
-  const total = payload.totalrecordcount ?? rows.length;
-  console.log(`483 citations — LegalName:"${firm}", ${total} total (showing latest ${Math.min(15, rows.length)}; frequency computed over the full set):`);
+  const { rows, truncated, url } = await dashboardQuery('inspections_citations', { LegalName: [firm] }, 'InspectionEndDate');
+  console.log(`483 citations — LegalName:"${firm}", ${rows.length} total (showing latest 15; frequency computed over the full set):`);
+  printTruncation(truncated, rows.length);
   const byClause = new Map();
   for (const r of rows) {
     const clause = r.ActCFRNumber ?? r.CFRNumber ?? '?';
@@ -262,7 +309,6 @@ async function cmdCitations(firm) {
   for (const r of rows.slice(0, 15)) {
     console.log(`- ${r.InspectionEndDate ?? '?'} | ${r.ActCFRNumber ?? r.CFRNumber ?? '?'} | ${(r.ShortDescription ?? '').slice(0, 90)}`);
   }
-  if (rows.length === 5000) console.log('Note: hit the 5000-row single-request cap; tallies may be incomplete.');
   if (byClause.size > 0) {
     console.log('');
     console.log('Clause frequency:');

@@ -20,7 +20,7 @@ description: Answer FDA regulatory-intelligence questions with official data ins
 
 | Subcommand | Purpose |
 |---|---|
-| `regulation <citation>` | Current CFR text + version date (eCFR) |
+| `regulation <citation>` | Current CFR text + version date (eCFR); removed sections fall back to the last pre-removal text, labeled historical |
 | `recalls <firm>` | Device recall/enforcement history (openFDA) |
 | `device <code or name>` | Classification / regulatory pathway; three uppercase letters = product code |
 | `events <product code>` | MAUDE adverse-event trend by year + event type |
@@ -35,6 +35,7 @@ description: Answer FDA regulatory-intelligence questions with official data ins
 
 ## Boundaries (state proactively)
 
+- Part 820 was restructured under QMSR; old QSR section numbers are removed from the current CFR. For such citations `regulation` reports the removed status plus the last historical text — always distinguish "current requirement" from "historical text" in answers.
 - Full 483 observation text is not in any public API; clause-level citations only.
 - Covers FDA inspections worldwide; no other regulators.
 - MAUDE counts are not incidence rates.
